@@ -228,46 +228,107 @@ class MorseCode:
     def _auto_threshold(self, env: np.ndarray) -> float:
         return (np.median(env) + np.max(env)) / 2.0
 
-    def from_audio(self, audio: np.ndarray, sample_rate: int) -> str:
+    def _from_audio(self, audio: np.ndarray, sample_rate: int) -> str:
         """Decode audio ndarray (mono or stereo) to plaintext"""
         if audio.ndim > 1:
-            audio = audio[:, 0]
+            audio = audio.mean(axis=1)
 
         audio = audio.astype(np.float32)
-        peak = np.max(np.abs(audio))
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
 
-        if peak > 0:
-            audio /= peak
+        if peak == 0.0:
+            return ""
 
-        # envelope follower ~2 ms
-        win = max(1, int(sample_rate * 0.002))
+        audio /= peak
+
+        win = max(1, int(sample_rate * 0.005))  # ~5ms
         env = self._env_follow(audio, win)
-        mask = env > self._auto_threshold(env)
 
-        if mask.size == 0:
+        # If the envelope is weirdly flat, bail early
+        if not np.isfinite(env).all() or env.size == 0:
+            return ""
+
+        # Hysteresis: rise on hi, fall on lo
+        thr_hi = float(np.percentile(env, 85))
+        if thr_hi <= 0:
+            return ""
+        thr_lo = 0.6 * thr_hi
+
+        mask = np.zeros_like(env, dtype=np.bool_)
+        state = False
+        for i, v in enumerate(env):
+            if not state and v >= thr_hi:
+                state = True
+            elif state and v <= thr_lo:
+                state = False
+            mask[i] = state
+
+        if not mask.any():
             return ""
 
         runs = self._run_lengths(mask)
+        if not runs:
+            return ""
 
-        # Timing (samples) according to this instance
-        dps = _wpm_to_dps(self.wpm)
-        dot_len = sample_rate / dps
-        scale = _farnsworth_scale(self.wpm, self.fs)
-        char_gap = CHAR_SPACE * scale * dot_len
-        word_gap = WORD_SPACE * scale * dot_len
+        on = np.array([L for is_tone, L in runs if is_tone], dtype=float)
+        off = np.array([L for is_tone, L in runs if not is_tone], dtype=float)
+        if on.size == 0:
+            return ""
+
+        # Drop extremely short leading/trailing runs (edge artifacts)
+        if runs and runs[0][1] < 3:
+            runs = runs[1:]
+        if runs and runs[-1][1] < 3:
+            runs = runs[:-1]
+        if not runs:
+            return ""
+
+        # Recompute arrays after trimming
+        on = np.array([L for is_tone, L in runs if is_tone], dtype=float)
+        off = np.array([L for is_tone, L in runs if not is_tone], dtype=float)
+        if on.size == 0:
+            return ""
+
+        # Estimate dot length: short tones cluster
+        dot_len = float(np.percentile(on, 20))
+
+        # Intra-element cutoff: short "off" inside a character (between dot/dash)
+        intra_elem_cut = 1.5 * dot_len
+
+        # Candidate letter/word gaps are off-runs >= intra-element cutoff
+        letterish = off[off >= intra_elem_cut]
+        if letterish.size == 0:
+            # Fallback: treat any >= intra-element as letter gap; no words
+            char_word_cut = float("inf")
+            char_gap_est = intra_elem_cut * 1.1
+        else:
+            # Two clusters: ~3 dot (letter) and ~7 dot (word). Use percentiles.
+            char_gap_est = float(np.percentile(letterish, 30))
+            word_gap_est = float(np.percentile(letterish, 85))
+            # If distribution is unimodal (no clear long gaps), avoid over-splitting
+            if word_gap_est < 1.8 * char_gap_est:
+                char_word_cut = float("inf")  # effectively no word gaps detected
+            else:
+                char_word_cut = 0.5 * (char_gap_est + word_gap_est)
+
+        # Tone classification margin: allow for slightly stretched dots
+        dot_dash_cut = 1.8 * dot_len
 
         symbols: List[str] = []
-        for is_tone, length in runs:
+        for is_tone, L in runs:
             if is_tone:
-                symbols.append(DOT if length < dot_len * 1.5 else DASH)
+                symbols.append(DOT if L < dot_dash_cut else DASH)
             else:
-                if length < dot_len * 1.5:
-                    # intra-element – ignore
+                if L < intra_elem_cut:
+                    # intra-element gap (between dot/dash within a letter) -> ignore
                     continue
-                # between letter or between word?
-                symbols.append(" " if length < (char_gap + word_gap) / 2 else "  ")
+                # Between letters or between words?
+                symbols.append(" " if L < char_word_cut else "  ")
 
-        return self._morse_to_text("".join(symbols).strip())
+        code = "".join(symbols).strip()
+        if not code:
+            return ""
+        return self._morse_to_text(code)
 
     def _morse_to_text(self, code: str) -> str:
         words: List[str] = []
@@ -281,7 +342,7 @@ class MorseCode:
     def from_wav(self, path: str | pathlib.Path) -> str:
         sr, data = wavfile.read(path)
 
-        return self.from_audio(data, sr)
+        return self._from_audio(data, sr)
 
     def decode(self, code: str) -> str:  # kept for API compat
         return self._morse_to_text(code)
